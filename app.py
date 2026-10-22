@@ -96,8 +96,8 @@ st.markdown(
         position: absolute;
         top: -30px;
         color: #D7EAFE;
-        opacity: 1.35;
-        font-size: 85px;
+        opacity: 0.35;
+        font-size: 15px;
         animation: friday-fall linear infinite;
     }
 
@@ -149,6 +149,11 @@ load_dotenv(dotenv_path=PROJECT_DIR / ".env", override=False)
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
+DEFAULT_GROQ_MODELS = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+]
+GROQ_API_URL = "https://api.groq.com/openai/v1"
 
 OLLAMA_URL = os.getenv(
     "OLLAMA_URL", "http://127.0.0.1:11434"
@@ -191,6 +196,12 @@ def unique_env_models(*variable_names):
 
 
 GEMINI_API_KEY = get_setting("GEMINI_API_KEY")
+GROQ_API_KEY = get_setting("GROQ_API_KEY")
+
+GROQ_MODELS = unique_env_models(
+    "GROQ_MODEL",
+    "GROQ_REASONING_MODEL",
+) or DEFAULT_GROQ_MODELS
 
 GEMINI_MODELS = unique_env_models(
     "GEMINI_MODEL",
@@ -240,10 +251,10 @@ with st.sidebar:
 
     provider = st.radio(
         "Choose AI provider",
-        options=["Gemini (cloud)", "Ollama (local)"],
+        options=["Gemini (cloud)", "Groq (cloud)", "Ollama (local)"],
         help=(
-            "Gemini uses your API key and internet. "
-            "Ollama runs models on this laptop."
+            "Gemini and Groq use cloud APIs and need internet access. "
+            "Ollama runs models locally on this laptop."
         ),
     )
 
@@ -258,6 +269,17 @@ with st.sidebar:
         )
 
         st.caption("Requires internet access and a valid Gemini API key.")
+
+    elif provider == "Groq (cloud)":
+        selected_model = st.selectbox(
+            "Groq model",
+            options=GROQ_MODELS,
+            help=(
+                "Configured using GROQ_MODEL and GROQ_REASONING_MODEL "
+                "in your .env file or Streamlit secrets."
+            ),
+        )
+        st.caption("Requires internet access and a valid Groq API key.")
 
     else:
         selected_model = st.selectbox(
@@ -279,6 +301,42 @@ with st.sidebar:
                 st.error(
                     "GEMINI_API_KEY was not found in .env or Streamlit secrets."
                 )
+
+        elif provider == "Groq (cloud)":
+            if GROQ_API_KEY:
+                st.success("Groq API key found (value hidden).")
+            else:
+                st.error(
+                    "GROQ_API_KEY was not found in .env or Streamlit secrets."
+                )
+
+            if st.button("Test Groq connection", use_container_width=True):
+                if not GROQ_API_KEY:
+                    st.error("Add GROQ_API_KEY to your local .env file first.")
+                else:
+                    try:
+                        check = requests.get(
+                            f"{GROQ_API_URL}/models",
+                            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                            timeout=(10, 20),
+                        )
+                        check.raise_for_status()
+                        st.success("Connected to Groq. API key was accepted.")
+                        available = [
+                            item.get("id", "")
+                            for item in check.json().get("data", [])
+                        ]
+                        if available:
+                            st.caption("Models returned by Groq (availability may vary by account):")
+                            st.write(", ".join(available[:30]))
+                    except requests.RequestException as exc:
+                        detail = ""
+                        if getattr(exc, "response", None) is not None:
+                            detail = (exc.response.text or "").strip()[:1000]
+                        st.error("Groq connection failed. Check your API key, internet connection, and account access.")
+                        st.code(detail or f"{type(exc).__name__}: {exc}", language="text")
+                    except (ValueError, AttributeError) as exc:
+                        st.error(f"Groq responded, but the response could not be read: {exc}")
 
         else:
             st.write(f"Ollama URL: `{OLLAMA_URL}`")
@@ -388,10 +446,73 @@ def call_gemini(model, history):
     return answer
 
 
+def call_groq(model, history):
+    """Call Groq's OpenAI-compatible chat completions API."""
+    if not GROQ_API_KEY:
+        raise RuntimeError(
+            "Groq API key is missing. Add GROQ_API_KEY to your local .env "
+            "file or Streamlit Cloud secrets."
+        )
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(
+        {
+            "role": item["role"],
+            "content": item["content"],
+        }
+        for item in history
+        if item.get("role") in {"user", "assistant"}
+        and item.get("content")
+    )
+
+    try:
+        response = requests.post(
+            f"{GROQ_API_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": 0.7,
+            },
+            timeout=(10, 180),
+        )
+        response.raise_for_status()
+    except requests.Timeout as exc:
+        raise RuntimeError(
+            f"Groq timed out while generating a response for '{model}'. Try again."
+        ) from exc
+    except requests.HTTPError as exc:
+        body = (response.text or "").strip()[:1500]
+        raise RuntimeError(
+            f"Groq returned HTTP {response.status_code} for model '{model}'. "
+            f"Response: {body or str(exc)}"
+        ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not reach Groq. Check internet access. Details: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    try:
+        payload = response.json()
+        answer = payload["choices"][0]["message"]["content"].strip()
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise RuntimeError(
+            f"Groq returned an unexpected response: {(response.text or '')[:1500]}"
+        ) from exc
+
+    if not answer:
+        raise RuntimeError(f"Groq returned an empty response for '{model}'.")
+
+    return answer
+
+
 def call_ollama(model, history):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT}
-    ]
+    """Send the conversation to the local Ollama API with clear diagnostics."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     messages.extend(
         {
@@ -399,30 +520,87 @@ def call_ollama(model, history):
             "content": item["content"],
         }
         for item in history
-        if item["role"] in {"user", "assistant"}
+        if item.get("role") in {"user", "assistant"}
+        and item.get("content")
     )
 
-    response = requests.post(
-        f"{OLLAMA_URL}/api/chat",
-        json={
-            "model": model,
-            "messages": messages,
-            "stream": False,
-        },
-        timeout=(5, 180),
-    )
+    # Check that the selected model is actually available on this Ollama host.
+    try:
+        tags_response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+        tags_response.raise_for_status()
+        installed_models = {
+            item.get("name", "")
+            for item in tags_response.json().get("models", [])
+        }
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Cannot reach Ollama at {OLLAMA_URL}. "
+            f"Check that Ollama is running. Details: {type(exc).__name__}: {exc}"
+        ) from exc
+    except (ValueError, AttributeError) as exc:
+        raise RuntimeError(
+            f"Ollama responded at {OLLAMA_URL}, but /api/tags returned "
+            f"unexpected data: {exc}"
+        ) from exc
 
-    response.raise_for_status()
+    if model not in installed_models:
+        installed = ", ".join(sorted(installed_models)) or "(no models listed)"
+        raise RuntimeError(
+            f"Selected model '{model}' was not found at {OLLAMA_URL}. "
+            f"Models reported by Ollama: {installed}"
+        )
 
-    answer = (
-        response.json()
-        .get("message", {})
-        .get("content", "")
-        .strip()
-    )
+    # Keep the request payload model-aware. Gemma 4 can spend a long time
+    # producing a separate reasoning trace for simple questions, so disable
+    # thinking for that model and cap the generated output to a sensible size.
+    chat_payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    if model == "gemma4:e2b":
+        chat_payload["think"] = False
+        chat_payload["options"] = {"num_predict": 800}
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json=chat_payload,
+            # Allow a slow first load, but avoid an unbounded wait.
+            timeout=(10, 600),
+        )
+        response.raise_for_status()
+    except requests.Timeout as exc:
+        raise RuntimeError(
+            f"Ollama timed out while generating a response for '{model}'. "
+            "The model may still be loading or generating. Try again, or "
+            "check Ollama's console."
+        ) from exc
+    except requests.HTTPError as exc:
+        body = (response.text or "").strip()[:1500]
+        raise RuntimeError(
+            f"Ollama returned HTTP {response.status_code} for model '{model}'. "
+            f"Response: {body or str(exc)}"
+        ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not send the chat request to Ollama at {OLLAMA_URL}. "
+            f"Details: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Ollama returned a non-JSON response: {(response.text or '')[:1000]}"
+        ) from exc
+
+    answer = payload.get("message", {}).get("content", "").strip()
 
     if not answer:
-        raise RuntimeError("Ollama returned an empty response.")
+        raise RuntimeError(
+            f"Ollama returned no answer for '{model}'. Response: {str(payload)[:1500]}"
+        )
 
     return answer
 
@@ -435,9 +613,11 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 
-provider_label = (
-    "Gemini" if provider == "Gemini (cloud)" else "Ollama"
-)
+provider_label = {
+    "Gemini (cloud)": "Gemini",
+    "Groq (cloud)": "Groq",
+    "Ollama (local)": "Ollama",
+}[provider]
 
 st.info(
     f"**Selected model:** {provider_label} · `{selected_model}`"
@@ -470,6 +650,11 @@ if question:
                         selected_model,
                         st.session_state.messages,
                     )
+                elif provider == "Groq (cloud)":
+                    answer = call_groq(
+                        selected_model,
+                        st.session_state.messages,
+                    )
                 else:
                     answer = call_ollama(
                         selected_model,
@@ -479,10 +664,8 @@ if question:
                 st.markdown(answer)
 
             except Exception as exc:
-                print(
-                    f"{provider_label} request failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+                error_detail = f"{type(exc).__name__}: {exc}"
+                print(f"{provider_label} request failed: {error_detail}")
 
                 if provider == "Gemini (cloud)":
                     answer = (
@@ -490,14 +673,23 @@ if question:
                         "Check your API key, model availability, quota "
                         "and internet connection."
                     )
+                    st.error(answer)
+                    st.caption(f"Technical details: {error_detail}")
+                elif provider == "Groq (cloud)":
+                    answer = (
+                        "Sorry, Boss. I couldn't get a response from Groq. "
+                        "Check your API key, model access, usage limits, "
+                        "and internet connection."
+                    )
+                    st.error(answer)
+                    st.code(error_detail, language="text")
                 else:
                     answer = (
                         "Sorry, Boss. I couldn't get a response from Ollama. "
-                        "Check that Ollama is running, the selected model "
-                        "is installed, and the Ollama URL is correct."
+                        "See the technical details below to identify the cause."
                     )
-
-                st.error(answer)
+                    st.error(answer)
+                    st.code(error_detail, language="text")
 
     st.session_state.messages.append(
         {"role": "assistant", "content": answer}
@@ -512,5 +704,5 @@ st.divider()
 
 st.caption(
     "Tip: switch providers in the sidebar whenever you want. "
-    "Gemini uses the cloud; Ollama uses your laptop's resources."
+    "Gemini and Groq use the cloud; Ollama uses your laptop's resources."
 )
